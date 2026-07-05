@@ -1,0 +1,6 @@
+torch>=1.12
+numpy>=1.21
+matplotlib>=3.5
+# Also requires the lab repo on PYTHONPATH for:
+#   models_transformer.spiking_layers  (QIF neuron)
+#   solvers.*                          (CAACT PDE solvers)

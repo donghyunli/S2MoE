@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.tar.gz
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc

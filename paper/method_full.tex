@@ -1,0 +1,342 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,bm,enumitem}
+\usepackage{graphicx}
+\usepackage[table]{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue}
+\title{\textbf{S\textsuperscript{2}MoE: Spiking-based Mixture-of-Experts for\\
+Scientific Machine Learning}\\[4pt]
+\large Shock/Smooth Spatial Specialization for Autoregressive PDE Rollout\\[2pt]
+\normalsize\textit{A Self-Contained Technical Report}}
+\author{Methods, Background, Equations, Protocol, and Results}
+\date{}
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip\hrule\bigskip
+
+%============================================================
+\section{Introduction and problem statement}\label{sec:intro}
+
+\subsection{What is a PDE surrogate?}
+Many physical systems (fluids, heat, traffic, phase separation) are described by \emph{partial
+differential equations} (PDEs): equations relating a field $u(x,t)$ (e.g.\ velocity, temperature,
+density) to its derivatives in space $x$ and time $t$. Classical numerical solvers integrate a PDE
+by taking many tiny time steps on a fine grid, which is accurate but expensive. A \emph{neural
+surrogate} is a neural network trained to imitate the solver: given the field now, predict the field
+a moment later, and iterate. Because it can take larger steps and run on a GPU, it is potentially
+much faster.
+
+We consider \emph{autoregressive rollout} surrogates. Let $u^t \in \mathbb{R}^{N_c\times N_x}$ denote
+the field at discrete time $t$, sampled on $N_x$ spatial points with $N_c$ physical channels (e.g.\
+$N_c{=}1$ for a scalar field, $N_c{=}2$ for a two-component system). A rollout surrogate learns a map
+\begin{equation}
+u^{t+1} = \mathcal{F}_\theta(u^t),
+\end{equation}
+and produces a trajectory by feeding its own output back in: $u^{t}\!\to\!u^{t+1}\!\to\!u^{t+2}\cdots$.
+This ``closed loop'' is powerful but fragile: small per-step errors accumulate and can blow up over a
+long rollout, so stability is a central concern.
+
+\subsection{Why spiking neurons?}
+Standard neural networks (``artificial neural networks'', ANNs) use continuous activations (ReLU,
+GELU). \emph{Spiking neural networks} (SNNs) instead use neurons that emit discrete $0/1$ ``spikes''
+when an internal state crosses a threshold, mimicking biological neurons. Their appeal is
+\emph{energy}: on neuromorphic hardware, a neuron that does not spike costs (almost) nothing, so
+sparse spiking can be very cheap. The trade-off is that spikes are discrete and harder to train, and
+SNNs are usually \emph{less accurate} than ANNs of the same size. Our codebase uses a specific
+spiking neuron, the \emph{quadratic integrate-and-fire} (QIF) neuron (Section~\ref{sec:qif}), for all
+nonlinearities.
+
+\subsection{Why a Mixture-of-Experts?}
+A \emph{Mixture-of-Experts} (MoE) replaces one network (``dense'') by several smaller sub-networks
+(``experts'') plus a small \emph{router} that decides, per input, how much each expert contributes.
+The intuition is \emph{specialization}: different experts can handle different kinds of input. For a
+PDE with a moving \emph{shock} (a sharp, nearly discontinuous front) sitting in an otherwise
+\emph{smooth} field, one might hope that one expert learns to handle the shock and another the smooth
+background. This report tests exactly that hope.
+
+\subsection{Our question and contribution}
+\emph{Does a spiking MoE, by specializing its experts to shock vs.\ smooth regions, outperform a
+spiking dense surrogate of comparable size on autoregressive PDE rollout?} Our findings:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item On advective \textbf{shock}-forming conservation laws (Burgers, Buckley--Leverett) the MoE
+      beats a parameter-matched spiking dense baseline using \emph{fewer} parameters ($\sim$24\%),
+      generalizing to held-out (unseen) PDE parameters.
+\item The advantage is caused by \emph{input-dependent routing}, not by merely having more branches:
+      replacing the learned router by uniform weights erases the gain on shock PDEs but not elsewhere.
+\item The experts specialize \emph{spatially}: one tracks the moving shock, the other the smooth region.
+\item The advantage is \emph{narrow and predictable}: it appears only when there is a moving
+      shock/smooth contrast \emph{and} the dense baseline is capacity-limited. On smooth, elliptic,
+      forced, or ``easy'' PDEs the MoE ties the dense baseline (it never loses to it in our final
+      configuration).
+\end{enumerate}
+
+%============================================================
+\section{Background concepts (from scratch)}\label{sec:bg}
+
+\subsection{Spiking neurons: LIF and QIF}
+A spiking neuron maintains a scalar \emph{membrane potential} $v$ that integrates its input; when $v$
+reaches a threshold $\theta$ it emits a spike and resets. The simplest model is the \emph{leaky
+integrate-and-fire} (LIF): $\tau \dot v = -v + I$, i.e.\ $v$ relaxes linearly toward the input $I$.
+The \emph{quadratic integrate-and-fire} (QIF) neuron adds a quadratic term:
+\begin{equation}\label{eq:qif-ode}
+\tau\,\dot v = a\,v^2 + \eta + I .
+\end{equation}
+This quadratic form is the \emph{normal form of a saddle-node bifurcation} and describes ``Type-I''
+excitability: for $\eta<0$ there are two fixed points (a stable rest state and an unstable
+threshold), and as the input $I$ increases they collide and disappear, after which $v$ accelerates to
+$+\infty$ in finite time --- a spike. Intuitively, QIF has a genuine, sharp firing onset (unlike the
+soft LIF), which is why it is a richer, more nonlinear neuron. We use QIF because it is the neuron in
+the codebase; Section~\ref{sec:qif} gives our exact discrete-time version.
+
+\subsection{Training spikes: surrogate gradients}
+The spike $s = H(v-\theta)$ (Heaviside step) has zero derivative almost everywhere, so ordinary
+backpropagation cannot train through it. The standard fix is a \emph{surrogate gradient}: use the
+true $0/1$ spike in the forward pass, but pretend, in the backward pass, that $s$ is a smooth
+function of $v$ with a bump-shaped derivative peaked at $v=\theta$. This lets gradients flow while
+keeping spikes discrete at inference.
+
+\subsection{Mixture-of-Experts: soft (1991) vs.\ sparse (2017)}
+The \emph{original} MoE (Jacobs, Jordan, Nowlan \& Hinton, 1991) is \emph{soft}: a gating network
+outputs a softmax weight for \emph{every} expert, and the output is the weighted sum of \emph{all}
+experts. Every expert runs on every input. The \emph{modern} MoE (Shazeer et al., 2017; Switch
+Transformer; Mixtral) is \emph{sparse}: the router picks only the top-$k$ experts ($k\ll E$), so most
+experts are skipped and compute stays constant as $E$ grows --- this is the ``efficient MoE'' people
+usually mean. \textbf{Our method is the soft, 1991-style MoE} (all experts active, input-dependent
+weights). We found that sparse top-$k$ routing did \emph{not} help in our setting; only soft gating
+did. Its efficiency therefore comes from being a \emph{parameter-efficient} multi-expert factorization,
+not from conditional-compute sparsity --- we are explicit about this to avoid over-claiming.
+
+%============================================================
+\section{Method: the surrogate in full detail}\label{sec:method}
+
+\subsection{Rollout backbone}
+The field enters and leaves through $1$D convolutions (kernel size $5$, ``same'' padding), with a
+\emph{residual} (skip) connection so the network predicts the \emph{change} rather than the full next
+state (this is standard for rollout and eases stability). With $C{=}48$ hidden channels,
+\begin{equation}
+h = W_1 \ast u^t \in \mathbb{R}^{C\times N_x},\qquad
+u^{t+1} = \mathcal{F}(u^t) = u^t + W_2 \ast \Phi(h),
+\end{equation}
+where $W_1:N_c\!\to\!C$, $W_2:C\!\to\!N_c$ are convolutions and $\Phi$ is the block (dense or MoE).
+The convolution gives each output location a small spatial receptive field; the block $\Phi$ is where
+the spiking nonlinearity and (for the MoE) the routing live.
+
+\subsection{QIF spiking neuron (exact discrete form)}\label{sec:qif}
+We use a one-step Euler discretization of Eq.~\eqref{eq:qif-ode} with a per-timestep reset. For drive
+$x$ (a channel of $h$) and membrane state $v$ (carried across rollout steps, initialized to $0$):
+\begin{align}
+\Delta v &= \big(a\,v^2 + \eta + x\big)\,\frac{\Delta t}{\tau}, \label{eq:qif1}\\
+v &\leftarrow v + \Delta v, \label{eq:qif2}\\
+s &= H(v-\theta) \quad\text{(spike, $0/1$)}, \label{eq:qif3}\\
+v &\leftarrow v\,(1-s) + v_{\mathrm{reset}}\,s. \label{eq:qif4}
+\end{align}
+Equation~\eqref{eq:qif1}--\eqref{eq:qif2} integrates the input with the quadratic self-drive
+$a v^2$; \eqref{eq:qif3} fires when the threshold is crossed; \eqref{eq:qif4} resets fired units to
+$v_{\mathrm{reset}}$ and leaves the rest unchanged. The learnable parameters (with defaults) are
+\[
+a=1,\quad \eta=0,\quad \tau=2,\quad \Delta t=1,\quad \theta=1,\quad v_{\mathrm{reset}}=-1,
+\]
+all trained by gradient descent. The block output is the spike tensor $s$.
+
+\paragraph{Surrogate gradient.} Forward uses the exact step $s=H(v-\theta)$. Backward uses
+\begin{equation}
+\frac{\partial s}{\partial v} \;\approx\; p\,\exp\!\big(-w\,|v-\theta|\big),
+\end{equation}
+a bump peaked at threshold, with learnable width $w$ and peak $p$ (initialized $w{=}2,p{=}1$).
+
+\subsection{Dense block (baseline)}
+A single QIF feed-forward ``expert'' with expansion ratio $R$: project up to width $RC$, apply the
+QIF neuron, project back to $C$:
+\begin{equation}
+\Phi_{\mathrm{dense}}(h) = W_{\downarrow}\,\mathrm{QIF}\!\big(W_{\uparrow}h\big),\qquad
+W_{\uparrow}\!:\!C\!\to\!RC,\ \ W_{\downarrow}\!:\!RC\!\to\!C.
+\end{equation}
+These $W_\uparrow, W_\downarrow$ are $1{\times}1$ convolutions (i.e.\ per-location linear maps). Our
+main baseline is \textbf{dense-R8} ($R{=}8$, hidden width $8C{=}384$).
+
+\subsection{Soft-gated MoE block (our method)}
+We use $E$ experts, each an up-projection $W_\uparrow^{(e)}\!:\!C\!\to\!RC$, plus a router
+$W_r\!:\!C\!\to\!E$, one \emph{shared} QIF neuron, and one down-projection $W_\downarrow\!:\!RC\!\to\!C$.
+At every spatial location $x$:
+\begin{align}
+g(x) &= \mathrm{softmax}\!\big(W_r\,h(x)\big) \in \mathbb{R}^{E}
+      &&\text{(per-location gate; $\textstyle\sum_e g_e=1$),}\\
+m(x) &= \sum_{e=1}^{E} g_e(x)\,\big(W_\uparrow^{(e)} h(x)\big) \in \mathbb{R}^{RC}
+      &&\text{(soft, all-expert mixture),}\\
+\Phi_{\mathrm{MoE}}(h) &= W_\downarrow\,\mathrm{QIF}(m).
+\end{align}
+Key points a first-time reader should note:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item The gate $g(x)$ depends on the \emph{local field content} $h(x)$, so \emph{different spatial
+      locations weight the experts differently} --- this is the ``routing''.
+\item \emph{All} experts contribute (soft / top-$E$); we are not skipping any. This is the 1991 MoE.
+\item The experts differ only in $W_\uparrow^{(e)}$; they share the QIF and the down-projection, which
+      keeps the parameter count small.
+\end{itemize}
+Our final configuration is \textbf{E2-soft-R4}: $E{=}2$ experts, ratio $R{=}4$.
+
+\subsection{Parameter accounting (derivation)}
+With $N_c{=}1$, $C{=}48$, kernel $5$, count weights$+$biases:
+\begin{align*}
+W_1 &: 1\cdot C\cdot5 + C, & W_2 &: C\cdot1\cdot5 + 1, \\
+W_r &: C\cdot E + E, & W_\downarrow &: RC\cdot C + C, & W_\uparrow^{(e)} &: C\cdot RC + RC \ \ (\times E).
+\end{align*}
+Summing, the MoE and dense totals are
+\begin{equation}
+P_{\mathrm{MoE}}(E,R) = 2352\,ER + 2304\,R + 49\,E + 583,\qquad
+P_{\mathrm{dense}}(R) = 4656\,R + 583.
+\end{equation}
+Hence \textbf{E2-soft-R4 $=28{,}713$} parameters versus \textbf{dense-R8 $=37{,}831$} --- the MoE is
+$24\%$ smaller. (For top-$k$ sparse variants one would replace $E$ by $k$ in the \emph{active}, i.e.\
+per-forward, count; we report soft gating where active $=$ total.)
+
+%============================================================
+\section{Benchmarks: the PDEs and how data is made}\label{sec:bench}
+All datasets are generated by the lab solver suite, which follows the \emph{CAACT} convention (the
+same benchmark family used by the spiking-SciML codebase). For each PDE we sweep one physical
+parameter over $12$ trajectories to create \emph{heterogeneity} (a range of regimes), and we
+evaluate on \emph{held-out} parameter values (interleaved, never seen in training) to test
+generalization. All fields are resampled to $N_x{=}128$ and normalized to zero mean, unit variance
+using training statistics.
+
+\begin{description}[leftmargin=0pt,itemsep=4pt]
+\item[Burgers (advective shock).] $\displaystyle \partial_t u + u\,\partial_x u = \nu\,\partial_{xx}u$,
+      viscosity $\nu\in[2,20]\times10^{-3}$. The nonlinear advection $u\partial_x u$ steepens the
+      profile into a \emph{moving shock}; the viscosity $\nu$ sets its sharpness. Sharp front on a
+      smooth background --- the canonical case for our mechanism.
+\item[Buckley--Leverett (CAACT form).]
+      $\displaystyle \partial_t u = \partial_{xx}\!\big(2u^2 + \tfrac43 u^3\big)$ on $[0,1]$ with
+      Dirichlet boundaries. A degenerate nonlinear diffusion that develops a sharp front; the
+      heterogeneity parameter is the initial-condition width.
+\item[Heat (smooth).] $\displaystyle \partial_t u = \alpha\,\partial_{xx}u$,
+      $\alpha\in[5,50]\times10^{-3}$, with the analytic $\sin(\pi x)$ Dirichlet mode. Pure diffusion:
+      the field only smooths out; there is \emph{no} sharp feature. This is a negative control:
+      the mechanism should give \emph{no} advantage.
+\item[Navier--Stokes 1D (forced Burgers).]
+      $\displaystyle \partial_t u + u\,\partial_x u = \nu\,\partial_{xx}u + f(x,t)$ with a random
+      time-varying body force $f$. The forcing keeps the whole field active, \emph{removing} the
+      quiescent smooth region --- a useful contrast to plain Burgers.
+\item[LWR traffic (scalar conservation law).]
+      $\displaystyle \partial_t \rho + \partial_x\big(\rho(1-\rho)\big)=0$. The Lighthill--Whitham--
+      Richards model of traffic; a localized jam steepens into a moving shock. (Implemented here with
+      a Rusanov finite-volume scheme; note this generator is \emph{not} part of the CAACT suite.)
+\end{description}
+
+%============================================================
+\section{Experimental protocol}\label{sec:protocol}
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+\item \textbf{Data.} $12$ trajectories per PDE (parameter sweep); train on the trajectories, evaluate
+      free rollout on held-out parameter values. Training horizon $T_{\mathrm{tr}}{=}45$ steps;
+      evaluation rollout $T{=}55$ steps ($>T_{\mathrm{tr}}$, testing extrapolation in time).
+\item \textbf{Loss (teacher forcing).} One-step mean-squared error on the training horizon:
+      \begin{equation}
+      \mathcal{L} = \frac{1}{T_{\mathrm{tr}}-1}\sum_{t=1}^{T_{\mathrm{tr}}-1}
+      \big\|\mathcal{F}(u^t)-u^{t+1}\big\|_2^2 .
+      \end{equation}
+      ``Teacher forcing'' means each training step is fed the \emph{true} $u^t$, not the model's own
+      prediction.
+\item \textbf{Optimizer.} AdamW, learning rate $10^{-3}$ with cosine decay to $10^{-5}$, weight decay
+      $10^{-5}$, gradient-norm clipping at $1.0$, $1500$ epochs. (These follow standard neural-PDE
+      practice; a fixed schedule is applied identically to \emph{both} dense and MoE for fairness.)
+\item \textbf{Repeats and significance.} $5$ random seeds; the main tables report the mean relative
+      $L_2$ and a Welch $t$-statistic for the dense$-$MoE difference ($|t|>2$ $\approx$ significant).
+      \textbf{Seed $42$ is the canonical reference seed}: released model weights and all figures are
+      produced with seed $42$ (its held-out errors, e.g.\ Burgers $0.097$, Buckley $0.064$, Heat
+      $0.133$, NS $0.186$, LWR $0.163$, are within seed variation of the $5$-seed means reported
+      below).
+\end{itemize}
+
+%============================================================
+\section{Metrics (defined and motivated)}\label{sec:metrics}
+\begin{description}[leftmargin=0pt,itemsep=4pt]
+\item[Relative $L_2$ error.] Accuracy of the free rollout:
+      $\ \mathrm{relL2}=\|\hat u-u\|_2/\|u\|_2$. A value $\gtrsim 1$ means the prediction is no better
+      than zero (diverged); good surrogates are well below $0.1$.
+\item[Routing-gain (causal control).] To prove that the benefit comes from \emph{input-dependent
+      routing} rather than from simply having several branches, we retrain the MoE with the router
+      \emph{disabled} --- fixed uniform gates $g_e\equiv 1/E$ --- and measure
+      \begin{equation}
+      \text{routing-gain} \;=\; \mathrm{relL2}_{\text{uniform}} - \mathrm{relL2}_{\text{learned}}.
+      \end{equation}
+      A large positive value means the learned router is doing real, causal work.
+\item[Specialization correlation.] To see \emph{where} experts act, we correlate each expert's
+      time-averaged spatial gate usage $\bar g_e(x)$ with the local sharpness $|\partial_x u|(x)$:
+      $\ \mathrm{corr}\big(\bar g_e(x),\,|\partial_x u|(x)\big)$. A strong positive/negative pair means
+      one expert concentrates on the sharp front and the other on the smooth region.
+\end{description}
+
+%============================================================
+\section{Results}\label{sec:results}
+
+\begin{table}[h]\centering
+\caption{Main comparison: our E2-soft-R4 MoE ($28.7$k params) vs.\ spiking dense-R8 ($37.8$k params).
+Held-out evaluation, $5$ seeds; lower relative $L_2$ is better. $t$ is Welch's statistic for
+(dense $-$ MoE).}
+\begin{tabular}{llcccc}
+\toprule
+Benchmark & character & MoE & dense-R8 & $t$ & verdict\\
+\midrule
+Burgers            & advective shock          & \textbf{0.111} & 0.144 & $3.54$ & \cellcolor{green!15}\textbf{WIN}\\
+Buckley--Leverett  & advective shock          & \textbf{0.075} & 0.094 & $3.33$ & \cellcolor{green!15}\textbf{WIN}\\
+Heat               & smooth (control)         & 0.133 & 0.133 & $-0.34$ & tie\\
+Navier--Stokes     & forced (no quiescence)   & 0.195 & 0.210 & $0.72$ & tie\\
+LWR                & scalar shock (unsat.\ dense) & 0.195 & 0.197 & $0.15$ & tie\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Efficiency (Pareto view).} On Burgers, spiking dense saturates with width --- relative
+$L_2$ of $0.175$, $0.144$, $0.144$ at $R{=}2,4,8$ (params $9.9$k, $19.2$k, $37.8$k) --- while the
+MoE reaches $0.111$ at $28.7$k, i.e.\ \emph{below} the dense curve at fewer parameters. Buckley behaves
+the same. So the MoE is not merely ``a bigger network''; it sits above the dense capacity frontier.
+
+\begin{table}[h]\centering
+\caption{Causal control and mechanism. Routing-gain isolates the learned router; the specialization
+correlation shows experts split shock vs.\ smooth.}
+\begin{tabular}{lccc}
+\toprule
+Benchmark & routing-gain & $t$ & $|\mathrm{corr}(\bar g,\,|\partial_x u|)|$\\
+\midrule
+Burgers            & $+0.037$ & $4.48$ & $0.87$\\
+Buckley--Leverett  & $+0.024$ & $4.08$ & $0.42$\\
+LWR                & $+0.041$ & $3.56$ & $0.95$\\
+Heat               & $\phantom{+}0.000$ & $0.02$ & (n/a; smooth)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretation.}
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item \textbf{The MoE wins only on advective shock PDEs}, and does so with fewer parameters than the
+      dense baseline. On smooth/forced PDEs it ties.
+\item \textbf{Routing is causal.} Disabling the router (uniform gates) erases the gain on shock PDEs
+      (routing-gain $t>3.5$) but changes nothing on Heat (routing-gain $\approx 0$). So the advantage
+      is the \emph{input-dependent} gating, not the extra branches.
+\item \textbf{Experts specialize spatially} to shock vs.\ smooth (strong $\pm$ correlations).
+\item \textbf{Specialization is necessary but not sufficient.} On LWR the router clearly helps the
+      MoE internally (routing-gain $+0.041$) and specialization is strongest ($0.95$), yet the MoE
+      only \emph{ties} the dense baseline --- because on LWR the dense baseline is not
+      capacity-saturated (adding width keeps helping it). The win over dense therefore needs
+      \emph{both} a routable shock/smooth contrast \emph{and} a capacity-limited dense baseline.
+\end{enumerate}
+
+%============================================================
+\section{Discussion, scope, and honest limitations}\label{sec:disc}
+\begin{itemize}[leftmargin=*,itemsep=3pt]
+\item \textbf{Where it works.} Moving shock against a quiescent smooth background, with a
+      capacity-limited dense baseline (Burgers, Buckley). This is a \emph{precise, falsifiable}
+      applicability boundary, which we regard as the main contribution rather than a single number.
+\item \textbf{Where it does not.} Smooth diffusion (Heat), elliptic problems, forced flows without a
+      quiescent region (NS), and shock problems that are either easy or where the dense baseline is
+      unsaturated (LWR) --- all ties.
+\item \textbf{Soft, not sparse.} Our gains come from the classical soft-gated (1991) MoE; sparse
+      top-$k$ routing did not help. We therefore claim \emph{parameter} efficiency (fewer stored /
+      per-step parameters at equal or better accuracy), \emph{not} the conditional-compute sparsity
+      of modern sparse MoE.
+\item \textbf{Provenance.} Burgers, Buckley, Heat, and NS follow the CAACT lab-solver convention;
+      the LWR generator is our own finite-volume implementation and is flagged as such.
+\end{itemize}
+
+\end{document}
