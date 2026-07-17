@@ -5,3 +5,6 @@ paper/*.aux
 paper/*.log
 paper/*.out
 paper/*.toc
+*.log
+experiments/_cache_*.pt
+experiments/saved_*.pt
